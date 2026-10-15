@@ -404,9 +404,114 @@ fn cell(v: f32) -> i64 {
     (v / CELL).floor() as i64
 }
 
-/// How far a redrawn glyph may sit from the one it redraws: a fifth of its height, as in `redraws`.
+/// How far a redrawn glyph may sit from the one it redraws ([`REDRAW_POSITION_TOLERANCE`] of its
+/// height), for `/ActualText` redraws, whole-run redraws (`redraws`) and run restarts.
 fn redraw_tolerance(rect: &[f32; 4]) -> f32 {
-    0.2 * (rect[3] - rect[1]).max(0.1)
+    REDRAW_POSITION_TOLERANCE * (rect[3] - rect[1]).max(0.1)
+}
+
+/// How far a glyph may sit from an earlier one, as a fraction of its height, to be the same glyph
+/// drawn again over it ([`drop_overdrawn`]): rounding, not design. A shadow, outline or fake bold
+/// copy a fraction of a point off is left to layout, which drops it run by run or glyph by glyph
+/// ([`REDRAW_POSITION_TOLERANCE`]); taking only some of its glyphs here would split it.
+const OVERDRAW_POSITION_TOLERANCE: f32 = 0.02;
+
+/// Largest difference in height, as a fraction of the taller, between a glyph and its overdraw.
+const OVERDRAW_HEIGHT_TOLERANCE: f32 = 0.1;
+
+/// Fewest glyphs lying over earlier ones, close together in content order, that are dropped as an
+/// overdraw. One or two coincidences (a field value starting at the same place as its label, with
+/// the same letters) are left to layout.
+const OVERDRAW_MIN_GLYPHS: usize = 3;
+
+/// Most glyphs drawn only once that may sit between two glyphs of one overdraw. Hancom's first
+/// drawing of a line leaves out its digits and some punctuation, which the second drawing has at
+/// their own places, as in "(재)" over "재".
+const OVERDRAW_MAX_GAP: usize = 3;
+
+/// The glyph's em box height (across the line) and advance (along it), from its quad.
+fn em_size(g: &TextGlyph) -> (f32, f32) {
+    let [a, b, _, d] = g.quad;
+    ((d[0] - a[0]).hypot(d[1] - a[1]), (b[0] - a[0]).hypot(b[1] - a[1]))
+}
+
+/// Whether `g` is glyph `p` drawn again at its place: the same text and writing direction, nearly
+/// the same size, and its box within `tol` of `p`'s.
+fn overdraws(p: &Drawn, g: &Drawn, tol: f32) -> bool {
+    let (ph, gh) = (em_size(&p.2).0, em_size(&g.2).0);
+    p.0 == g.0
+        && compatible(p.1, g.1)
+        && p.2.text == g.2.text
+        && (ph - gh).abs() <= OVERDRAW_HEIGHT_TOLERANCE * ph.max(gh)
+        && (p.2.rect[0] - g.2.rect[0]).abs() < tol
+        && (p.2.rect[1] - g.2.rect[1]).abs() < tol
+}
+
+/// Drops text drawn a second time over itself anywhere on the page. Hancom Office (HWP → PDF) draws
+/// bold lines word by word and then draws the words again at exactly the same places, with other
+/// glyphs between the copies, so the two drawings break into runs differently and the whole-run
+/// check in layout (`redraws`) misses them.
+///
+/// A glyph lies over an earlier one when [`overdraws`] holds within [`OVERDRAW_POSITION_TOLERANCE`]
+/// of its height (and half its advance, so condensed "ll" stays two letters). Such glyphs with at
+/// most [`OVERDRAW_MAX_GAP`] other glyphs between neighbours form a group, and a group of at least
+/// [`OVERDRAW_MIN_GLYPHS`] is dropped; the glyphs between them, and the earliest drawing of each
+/// glyph, stay. Earlier glyphs are found through a grid keyed by text and cell, and the work is
+/// capped by [`MAX_REDRAW_WORK`]: past it, the remaining glyphs are kept.
+fn drop_overdrawn(glyphs: Vec<Drawn>) -> Vec<Drawn> {
+    let mut over = vec![false; glyphs.len()];
+    {
+        let mut grid: HashMap<(&str, i64, i64), Vec<usize>> = HashMap::new();
+        let mut budget = MAX_REDRAW_WORK;
+        for (j, g) in glyphs.iter().enumerate() {
+            let (h, w) = em_size(&g.2);
+            let mut tol = OVERDRAW_POSITION_TOLERANCE * h.max(0.1);
+            if w > 0.05 * h {
+                tol = tol.min(0.5 * w);
+            }
+            let r = g.2.rect;
+            let (x0, x1, y0, y1) = (cell(r[0] - tol), cell(r[0] + tol), cell(r[1] - tol), cell(r[1] + tol));
+            let cells = x1.saturating_sub(x0).saturating_add(1).saturating_mul(y1.saturating_sub(y0).saturating_add(1));
+            if tol.is_finite() && cells <= MAX_CELLS {
+                'search: for key in (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| (g.2.text.as_str(), x, y))) {
+                    let Some(rest) = budget.checked_sub(1) else { break };
+                    budget = rest;
+                    for &i in grid.get(&key).map_or(&[][..], Vec::as_slice) {
+                        let Some(rest) = budget.checked_sub(1) else { break 'search };
+                        budget = rest;
+                        if glyphs.get(i).is_some_and(|p| overdraws(p, g, tol)) {
+                            if let Some(o) = over.get_mut(j) {
+                                *o = true;
+                            }
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            grid.entry((g.2.text.as_str(), cell(r[0]), cell(r[1]))).or_default().push(j);
+        }
+    }
+    let mut keep = vec![true; glyphs.len()];
+    // The glyphs over earlier ones in the open group.
+    let mut group: Vec<usize> = Vec::new();
+    let close = |group: &mut Vec<usize>, keep: &mut [bool]| {
+        if group.len() >= OVERDRAW_MIN_GLYPHS {
+            for &k in group.iter() {
+                if let Some(keep) = keep.get_mut(k) {
+                    *keep = false;
+                }
+            }
+        }
+        group.clear();
+    };
+    for j in over.iter().enumerate().filter_map(|(j, over)| over.then_some(j)) {
+        if group.last().is_some_and(|&last| j.saturating_sub(last) > OVERDRAW_MAX_GAP.saturating_add(1)) {
+            close(&mut group, &mut keep);
+        }
+        group.push(j);
+    }
+    close(&mut group, &mut keep);
+    glyphs.into_iter().zip(keep).filter_map(|(g, keep)| keep.then_some(g)).collect()
 }
 
 /// One glyph carrying `text`, boxed around `drawn` in their writing direction; `None` when they
@@ -667,7 +772,7 @@ pub(crate) fn extract_page(pdf: &Pdf, page: usize, settings: &InterpreterSetting
     interpret_page(p, &mut ctx, &mut dev);
     // A replacement the content never closed ends with the page.
     dev.finish();
-    let glyphs = dev.glyphs;
+    let glyphs = drop_overdrawn(dev.glyphs);
     // Text on a curved path: glyphs that each continue the previous one's line while the
     // direction turns. Each such run is one line.
     let turned = |u: [f64; 2]| u[0].abs().min(u[1].abs()) > DIRECTION_TOLERANCE;
@@ -1042,7 +1147,7 @@ fn redraws(glyphs: &[&TextGlyph], a: Run, b: Run) -> bool {
     a.len() == b.len()
         && a.range().zip(b.range()).all(|(i, j)| match (glyphs.get(i), glyphs.get(j)) {
             (Some(p), Some(g)) => {
-                let tol = REDRAW_POSITION_TOLERANCE * (g.rect[3] - g.rect[1]).max(0.1);
+                let tol = redraw_tolerance(&g.rect);
                 p.text == g.text && (p.rect[0] - g.rect[0]).abs() < tol && (p.rect[1] - g.rect[1]).abs() < tol
             }
             _ => false,
@@ -1057,7 +1162,7 @@ fn within_position_tolerance(a: f32, b: f32, tolerance: f32) -> bool {
 /// bounds this check and requires more than a single backward adjustment to split a run.
 fn restarts_run(glyphs: &[&TextGlyph], start: usize, next: usize, progress: f32) -> bool {
     let (Some(first), Some(candidate)) = (glyphs.get(start), glyphs.get(next)) else { return false };
-    let tol = REDRAW_POSITION_TOLERANCE * (candidate.rect[3] - candidate.rect[1]).max(0.1);
+    let tol = redraw_tolerance(&candidate.rect);
     if first.text != candidate.text
         || !within_position_tolerance(first.rect[0], candidate.rect[0], tol)
         || !within_position_tolerance(first.rect[1], candidate.rect[1], tol)
@@ -1072,7 +1177,7 @@ fn restarts_run(glyphs: &[&TextGlyph], start: usize, next: usize, progress: f32)
         let (Some(a), Some(b)) = (start.checked_add(offset).and_then(|i| glyphs.get(i)), next.checked_add(offset).and_then(|i| glyphs.get(i))) else {
             return false;
         };
-        let tol = REDRAW_POSITION_TOLERANCE * (b.rect[3] - b.rect[1]).max(0.1);
+        let tol = redraw_tolerance(&b.rect);
         if a.text != b.text || !within_position_tolerance(a.rect[0], b.rect[0], tol) || !within_position_tolerance(a.rect[1], b.rect[1], tol) {
             return false;
         }
@@ -1344,7 +1449,8 @@ fn arrange(glyphs: &[TextGlyph]) -> (Vec<usize>, Vec<u32>, Vec<bool>) {
         }
     }
     // A run that redraws an earlier run at the same place (doubled or shadowed text) is dropped, as a doubled glyph is
-    // above. Runs are keyed by a fingerprint of their glyph texts and a grid cell a fifth of a line high. A key leads to
+    // above. Extracted pages have already lost text drawn again exactly over itself, whatever its runs
+    // (`drop_overdrawn`); this pass also takes a whole run shadowed up to a fifth of a line away. Runs are keyed by a fingerprint of their glyph texts and a grid cell a fifth of a line high. A key leads to
     // the latest retained run with it, and `older[k]` links each retained run to the previous one with the same key, so
     // the earlier candidates are checked newest first, up to `REDRAW_CANDIDATES`. Both exist only for this pass.
     let retained = {
@@ -2418,6 +2524,106 @@ mod tests {
         // below are a separate line, as they are not a redraw.
         let ops = run_ops(&[("Hello world", "1 0 0 1 100 200"), ("Hello world", "1 0 0 1 100.1 200.1"), ("Hello world", "1 0 0 1 100 100")]);
         assert_eq!(page_text(&ops), "Hello world\nHello world");
+    }
+
+    #[test]
+    fn words_drawn_again_over_themselves_read_once_whatever_their_runs() {
+        // Hancom Office draws a bold line word by word, then draws the line again over it with its
+        // number in front, so the second drawing runs "1.Alphabetagamma" against the first's
+        // "Alphabetagamma". The number is drawn once and stays.
+        let line = [("Alpha", "1 0 0 1 100 200"), ("beta", "1 0 0 1 140 200"), ("gamma", "1 0 0 1 175 200")];
+        let mut runs = line.to_vec();
+        runs.push(("1.", "1 0 0 1 80 200"));
+        runs.extend(line);
+        assert_eq!(page_text(&run_ops(&runs)), "1. Alpha beta gamma");
+        // A third drawing, and one in reverse word order, are dropped too.
+        runs.extend(line);
+        runs.extend(line.iter().rev());
+        assert_eq!(page_text(&run_ops(&runs)), "1. Alpha beta gamma");
+        // The same line a line lower is a line of its own.
+        runs.extend(line.map(|(w, _)| w).iter().zip(["1 0 0 1 100 180", "1 0 0 1 140 180", "1 0 0 1 175 180"]).map(|(w, tm)| (*w, tm)));
+        assert_eq!(page_text(&run_ops(&runs)), "1. Alpha beta gamma\nAlpha beta gamma");
+    }
+
+    #[test]
+    fn repeated_letters_set_tight_are_not_overdraws() {
+        // Runs of one letter at its own advance, down to 30 % horizontal scaling: every letter stays.
+        for tz in [100, 50, 30] {
+            let ops = format!("BT /F1 12 Tf {tz} Tz 1 0 0 1 100 200 Tm (lllll....iiiii) Tj ET\n");
+            assert_eq!(page_text(&ops), "lllll....iiiii", "at {tz} % scaling");
+        }
+        // The same digit in every cell of a table row, and a word repeated along a line.
+        let ops = run_ops(&[("0", "1 0 0 1 100 200"), ("0", "1 0 0 1 130 200"), ("0", "1 0 0 1 160 200"), ("0", "1 0 0 1 190 200")]);
+        assert_eq!(page_text(&ops).matches('0').count(), 4);
+        assert_eq!(page_text("BT /F1 12 Tf 1 0 0 1 50 200 Tm (ha ha ha ha) Tj ET"), "ha ha ha ha");
+    }
+
+    /// Glyphs of `text` from `x` at `advance` per character on the baseline at `y`, in content order.
+    fn drawn(text: &str, x: f32, y: f32, advance: f32, height: f32) -> Vec<Drawn> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let x0 = x + i as f32 * advance;
+                let rect = [x0, y, x0 + advance, y + height];
+                let quad = [[x0, rect[3]], [rect[2], rect[3]], [rect[2], y], [x0, y]];
+                (0, [1.0, 0.0], TextGlyph { text: c.to_string(), rect, quad, direction: [1.0, 0.0] })
+            })
+            .collect()
+    }
+
+    fn texts(glyphs: &[Drawn]) -> String {
+        glyphs.iter().map(|g| g.2.text.as_str()).collect()
+    }
+
+    #[test]
+    fn overdraws_need_the_same_letter_size_and_direction_and_a_few_in_a_row() {
+        // Hangul syllables repeated at their own advance stay.
+        assert_eq!(texts(&drop_overdrawn(drawn("ㅎㅎㅎㅎ하하하", 10.0, 10.0, 10.0, 10.0))), "ㅎㅎㅎㅎ하하하");
+        // Drawn again at the same place, to within rounding: dropped.
+        let mut v = drawn("한글", 10.0, 10.0, 10.0, 10.0);
+        v.extend(drawn("가나다라", 100.0, 10.0, 10.0, 10.0));
+        v.extend(drawn("가나다라", 100.1, 10.1, 10.0, 10.0));
+        assert_eq!(texts(&drop_overdrawn(v.clone())), "한글가나다라");
+        // Glyphs drawn only once inside the copy stay with it: the first drawing left out the
+        // brackets and the hyphen.
+        let mut v = drawn("재", 110.0, 10.0, 10.0, 10.0);
+        v.extend(drawn("경남", 130.0, 10.0, 10.0, 10.0));
+        v.extend(drawn("센터", 160.0, 10.0, 10.0, 10.0));
+        v.extend(drawn("(재)경남-센터", 100.0, 10.0, 10.0, 10.0));
+        assert_eq!(texts(&drop_overdrawn(v)), "재경남센터()-");
+        // Two near each other are left to layout, as are copies a twentieth of a line away (a
+        // shadow), a fifth taller, or turned a quarter.
+        let mut short = drawn("가나다라", 100.0, 10.0, 10.0, 10.0);
+        short.extend(drawn("가나", 100.0, 10.0, 10.0, 10.0));
+        assert_eq!(drop_overdrawn(short).len(), 6);
+        // Three over earlier glyphs, but four new glyphs apart, are not one overdraw.
+        let mut apart = drawn("가나다라마바사", 100.0, 10.0, 10.0, 10.0);
+        apart.extend(drawn("가나XXXX사", 100.0, 10.0, 10.0, 10.0));
+        assert_eq!(drop_overdrawn(apart).len(), 14);
+        for (dx, scale, quarter) in [(0.5, 1.0, 0), (0.0, 1.2, 0), (0.0, 1.0, 1)] {
+            let mut v = drawn("가나다라", 100.0, 10.0, 10.0, 10.0);
+            let copy = drawn("가나다라", 100.0 + dx, 10.0, 10.0, 10.0 * scale);
+            v.extend(copy.into_iter().map(|mut g| {
+                g.0 = quarter;
+                g
+            }));
+            assert_eq!(drop_overdrawn(v).len(), 8, "{dx} pt along, {scale}× as tall, {quarter} quarters turned");
+        }
+    }
+
+    #[test]
+    fn overdraw_work_is_bounded_on_hostile_pages() {
+        // 50,000 copies of one letter at one spot, then 50,000 more a fifth larger: each later
+        // glyph would compare all of the first 50,000 before finding its own size (10^9 comparisons).
+        const N: usize = 50_000;
+        let mut v: Vec<Drawn> = (0..N).flat_map(|_| drawn("x", 10.0, 10.0, 10.0, 10.0)).collect();
+        v.extend((0..N).flat_map(|_| drawn("x", 10.0, 10.0, 12.0, 12.0)));
+        let started = std::time::Instant::now();
+        let kept = drop_overdrawn(v);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "took {:?}", started.elapsed());
+        // The first drawing stays; past the budget the larger copies are kept.
+        assert_eq!(kept.first().map(|g| g.2.rect[3]), Some(20.0));
+        assert!(kept.len() > N / 2 && kept.len() <= N + 1, "{} kept", kept.len());
     }
 
     #[test]
